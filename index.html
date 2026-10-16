@@ -517,9 +517,11 @@ document.addEventListener("gesturestart", (e) => e.preventDefault());
 document.addEventListener("dblclick", (e) => e.preventDefault());
 
 // ===== Layout =====
+let lastVw = 0, lastVh = 0;
 function layout() {
-  dpr = window.devicePixelRatio || 1;
+  dpr = Math.min(window.devicePixelRatio || 1, 4);
   const vw = window.innerWidth, vh = window.innerHeight;
+  lastVw = vw; lastVh = vh;
   canvas.width = Math.round(vw * dpr);
   canvas.height = Math.round(vh * dpr);
   canvas.style.width = vw + "px";
@@ -534,6 +536,8 @@ function layout() {
   offY = (vh - H * scale) / 2;
 }
 window.addEventListener("resize", layout);
+window.addEventListener("orientationchange", layout);
+window.addEventListener("load", layout);
 
 // ===== Drawing =====
 function shade(hex, f) {
@@ -760,6 +764,7 @@ function render() {
       `fps ${fps.toFixed(0)}  t ${t.toFixed(1)}s  speed ${speed.toFixed(1)}`,
       `balls ${balls.length}  walls ${walls.length}  nudges ${nudges}  clears ${clears}  seed ${SEED}`,
       `state ${state}${line ? "  drawing " + line.pts.length + " pts" : ""}`,
+      `dpr ${dpr}  canvas ${canvas.width}x${canvas.height}  screen ${innerWidth}x${innerHeight}`,
       ...Object.entries(CONFIG).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(" ") : v}`),
     ];
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -781,6 +786,9 @@ function frame(now) {
   last = now;
   if (raw > 0) fps = fps * 0.95 + (1 / raw) * 0.05;
   const dt = Math.min(raw, 1 / 30);
+  // iOS can report the wrong pixel density or size while the page is still loading (often from a
+  // home-screen icon), which would leave a blurry canvas. Re-measure whenever either changes.
+  if (Math.min(window.devicePixelRatio || 1, 4) !== dpr || window.innerWidth !== lastVw || window.innerHeight !== lastVh) layout();
   if (state === "playing") update(dt);
   else if (state === "over") overAge += dt;
   // Effects keep playing out after the game ends, so a last clear finishes its pop.
