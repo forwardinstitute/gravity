@@ -41,6 +41,7 @@ const CONFIG = {
   lineWidth: 7,          // thickness of a drawn line, and of the wall it becomes
   minSegment: 6,         // shortest line segment recorded while drawing
   selfSkip: 4,           // recent segments ignored by the self-crossing check, so finger jitter doesn't end the game
+  wallGrace: 14,         // around the ball a line leaves or reaches, its own attached walls are ignored this far beyond the ball's edge
   touchSlop: 1.6,        // how generous pressing on a ball is, as a multiple of its radius
   startNudges: 3,
   clearChain: 4,         // a chain of this many same-colour balls, joined by lines, clears from the board
@@ -117,6 +118,18 @@ function orient(p, q, r) { return (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x
 function segsCross(a, b, c, d) {
   const d1 = orient(c, d, a), d2 = orient(c, d, b), d3 = orient(a, b, c), d4 = orient(a, b, d);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+// The part of segment a-q outside the circle (centre c, radius rz): null if it is all inside.
+function clipOutside(a, q, c, rz) {
+  const ina = Math.hypot(a.x - c.x, a.y - c.y) < rz, inq = Math.hypot(q.x - c.x, q.y - c.y) < rz;
+  if (ina && inq) return null;
+  if (!ina && !inq) return [a, q];
+  const dx = q.x - a.x, dy = q.y - a.y, fx = a.x - c.x, fy = a.y - c.y;
+  const A = dx * dx + dy * dy, B = 2 * (fx * dx + fy * dy), C = fx * fx + fy * fy - rz * rz;
+  const disc = Math.sqrt(Math.max(0, B * B - 4 * A * C));
+  const t = ina ? (-B + disc) / (2 * A) : (-B - disc) / (2 * A);
+  const p = { x: a.x + dx * t, y: a.y + dy * t };
+  return ina ? [p, q] : [a, p];
 }
 function segSegDist(a, b, c, d) {
   if (segsCross(a, b, c, d)) return 0;
@@ -336,7 +349,7 @@ function join(o, prefix, a, b, fromFinger) {
   // join cleared it or ended the game. Lifting the finger ends the stroke.
   if (fromFinger && state === "playing" && balls.includes(o)) {
     o.prev = "wall";
-    line = { ball: o, pid, pts: [{ x: o.x, y: o.y }], finger: { x: b.x, y: b.y } };
+    line = { ball: o, pid, pts: [{ x: o.x, y: o.y }], finger: { x: b.x, y: b.y }, cameFrom: walls[walls.length - 1] };
   }
 }
 
@@ -399,10 +412,24 @@ function checkSegment(a, q) {
       } else { lose(o.x, o.y); return "lose"; }
     }
   }
+  // Walls attached to the ball the line leaves, or the ball it is reaching, get a small grace zone
+  // around that ball, so leaving or arriving at a shallow angle beside your own wall is allowed.
+  const exempt = [s].concat(target ? [target] : []);
   for (const w of walls) {
+    let A = a, Q = q, skip = false;
+    for (const e of exempt) {
+      if (w.a !== e.id && w.b !== e.id) continue;
+      const clipped = clipOutside(A, Q, e, R + CONFIG.wallGrace);
+      if (!clipped) { skip = true; break; }
+      [A, Q] = clipped;
+    }
+    if (skip) continue;
     for (let i = 0; i < w.pts.length - 1; i++) {
-      if (segSegDist(a, q, w.pts[i], w.pts[i + 1]) < 2 * LH) {
-        const c = closestOnSeg(q.x, q.y, w.pts[i], w.pts[i + 1]);
+      if (segSegDist(A, Q, w.pts[i], w.pts[i + 1]) < 2 * LH) {
+        // A carried-on stroke that runs back over the line it has only just made, close to the ball,
+        // simply ends the stroke: dragging back the way you came reads as "done", not a crash.
+        if (w === line.cameFrom && Math.hypot(q.x - s.x, q.y - s.y) < R * 4) { cancelLine(); return "cancel"; }
+        const c = closestOnSeg(Q.x, Q.y, w.pts[i], w.pts[i + 1]);
         lose(c.x, c.y); return "lose";
       }
     }
