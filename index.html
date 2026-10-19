@@ -43,7 +43,10 @@ const CONFIG = {
   selfSkip: 4,           // recent segments ignored by the self-crossing check, so finger jitter doesn't end the game
   wallGrace: 14,         // around the ball a line leaves or reaches, its own attached walls are ignored this far beyond the ball's edge
   touchSlop: 1.6,        // how generous pressing on a ball is, as a multiple of its radius
-  startNudges: 3,
+  startNudges: 5,
+  maxNudges: 5,          // nudges never go above this; each clear gives one back
+  freeLineChain: 6,      // a clear of this many balls or more earns a free line
+  freeLineMin: 40,       // shortest free line that can be placed
   wildChance: 0.04,      // chance any new ball is a chameleon: it joins any colour and becomes the colour it joins
   wallLoad: 6,           // a line holds this many stuck balls (resting on it directly or stacked); one more and it snaps
   clearChain: 4,         // a chain of this many same-colour balls, joined by lines, clears from the board
@@ -143,6 +146,7 @@ function segSegDist(a, b, c, d) {
 // Ball states: "falling", "stuck" (touched a wall or stuck ball), "pinned" (a line is being drawn from it), "wall" (joined).
 // Walls are lines between two balls, stored edge to edge, with the ids of the balls at each end, so joined balls form chains.
 let state = "ready"; // "ready" | "playing" | "over"
+let wilds, freeLines, armed, freeDraw, trayPulse;
 let rng, balls, walls, line, t, spawnTimer, score, bestChain, clears, nudges, fail, overAge, shake, fx, nextId;
 
 function reset() {
@@ -150,7 +154,8 @@ function reset() {
   rng = mulberry32(SEED);
   balls = []; walls = []; line = null; fx = [];
   t = 0; spawnTimer = CONFIG.spawnInterval; // first ball arrives straight away
-  score = 0; bestChain = 0; clears = 0; nudges = CONFIG.startNudges;
+  score = 0; bestChain = 0; clears = 0;
+  wilds = 0; freeLines = 0; armed = false; freeDraw = null; trayPulse = { wild: 0, line: 0 }; nudges = CONFIG.startNudges;
   fail = null; overAge = 0; shake = 0; nextId = 1;
 }
 
@@ -351,7 +356,7 @@ function join(o, prefix, a, b, fromFinger) {
   const raw = prefix.concat([cp, { x: o.x, y: o.y }]);
   walls.push({ pts: trimToEdges(raw, s, o), c: s.c, a: s.id, b: o.id });
   s.state = "wall"; o.state = "wall"; s.vx = 0; o.vx = 0; s.vy = 0; o.vy = 0;
-  score += CONFIG.pointsPerJoin; nudges++;
+  score += CONFIG.pointsPerJoin;
   fx.push({ type: "join", x: o.x, y: o.y, c: s.c, age: 0, life: 0.5 });
   line = null;
   clearChain(s, merge);
@@ -373,6 +378,10 @@ function clearChain(start, merge) {
   const gain = chain.size * chain.size * (merge ? CONFIG.mergeBoost : 1);
   score += gain;
   clears++;
+  // What a clear earns: a nudge back, a wild for a merge, a free line for a big chain.
+  nudges = Math.min(CONFIG.maxNudges, nudges + 1);
+  if (merge) { wilds++; trayPulse.wild = 1; }
+  if (chain.size >= CONFIG.freeLineChain) { freeLines++; trayPulse.line = 1; }
   let mx = 0, my = 0;
   for (const b of balls) if (chain.has(b.id)) {
     fx.push({ type: "clear", x: b.x, y: b.y, c: b.c, age: 0, life: 0.6 });
@@ -531,6 +540,47 @@ function checkLineAgainstFalling() {
   }
 }
 
+// ===== Power-ups =====
+// The tray sits at the top centre: a wild ball on demand, and free lines.
+function trayPos() { return { wild: { x: W / 2 - 30, y: 24 }, line: { x: W / 2 + 30, y: 24 } }; }
+function trayHit(p) {
+  const t = trayPos();
+  if (wilds > 0 && Math.hypot(p.x - t.wild.x, p.y - t.wild.y) < 22) return "wild";
+  if ((freeLines > 0 || armed) && Math.hypot(p.x - t.line.x, p.y - t.line.y) < 22) return "line";
+  return null;
+}
+function spotFree(x, y) {
+  return !nearWall(x, y, R + LH) && !balls.some(o => Math.hypot(o.x - x, o.y - y) < 2 * R);
+}
+// Drops a wild ball straight away, somewhere free along the top.
+function dropWild() {
+  for (let i = 0; i < 40; i++) {
+    const x = R + Math.random() * (W - 2 * R);
+    if (spotFree(x, R)) {
+      balls.push({ id: nextId++, x, y: R, vx: 0, vy: 0, c: -1, state: "falling", prev: null });
+      wilds--;
+      return;
+    }
+  }
+}
+// A free line is straight, joins no balls, and carries load like any other line.
+function freeClear(a, b) {
+  for (const q of [a, b]) if (q.x < LH || q.x > W - LH || q.y < LH || q.y > H - LH) return false;
+  if (Math.hypot(b.x - a.x, b.y - a.y) < CONFIG.freeLineMin) return false;
+  for (const o of balls) if (distPtSeg(o.x, o.y, a, b) < R + LH) return false;
+  for (const w of walls) for (let i = 0; i < w.pts.length - 1; i++) if (segSegDist(a, b, w.pts[i], w.pts[i + 1]) < 2 * LH) return false;
+  return true;
+}
+function placeFree() {
+  const { a, b } = freeDraw;
+  freeDraw = null;
+  if (state !== "playing" || !freeClear(a, b)) return; // blocked or too short: nothing placed, the power-up is kept
+  walls.push({ pts: [a, b], c: -2, a: null, b: null, free: true });
+  freeLines--;
+  armed = false;
+  applyLoad();
+}
+
 // ===== Input =====
 function toBoard(e) {
   return { x: (e.clientX - offX) / scale, y: (e.clientY - offY) / scale };
@@ -549,7 +599,15 @@ canvas.addEventListener("pointerdown", (e) => {
     if (overAge > 0.5 && replayHit(p)) { reset(); state = "playing"; }
     return;
   }
-  if (line) return; // one line at a time
+  if (line || freeDraw) return; // one line at a time
+  const tray = trayHit(p);
+  if (tray === "wild") { dropWild(); return; }
+  if (tray === "line") { armed = !armed && freeLines > 0; return; }
+  if (armed) {
+    freeDraw = { pid: e.pointerId, a: p, b: p };
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    return;
+  }
   const b = ballAt(p);
   if (b) {
     startLine(b, e.pointerId, p);
@@ -559,6 +617,7 @@ canvas.addEventListener("pointerdown", (e) => {
   }
 });
 canvas.addEventListener("pointermove", (e) => {
+  if (state === "playing" && freeDraw && e.pointerId === freeDraw.pid) { freeDraw.b = toBoard(e); return; }
   if (state !== "playing" || !line || e.pointerId !== line.pid) return;
   const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
   for (const ev of (evs.length ? evs : [e])) {
@@ -567,6 +626,7 @@ canvas.addEventListener("pointermove", (e) => {
   }
 });
 function endPointer(e) {
+  if (freeDraw && e.pointerId === freeDraw.pid) { placeFree(); return; }
   if (line && e.pointerId === line.pid && state === "playing") cancelLine();
 }
 canvas.addEventListener("pointerup", endPointer);
@@ -662,6 +722,36 @@ function drawChameleon(b) {
   ctx.fillStyle = BRAND.day; ctx.fill();
 }
 
+// The power-up tray: faint when empty, a count when there's more than one, a ring when one is earned.
+function drawTray() {
+  const t = trayPos();
+  const count = (n, x, y) => {
+    if (n < 2) return;
+    ctx.fillStyle = BRAND.night; ctx.font = "700 13px " + BRAND.display;
+    ctx.textAlign = "left"; ctx.textBaseline = "middle"; ctx.fillText(String(n), x + 13, y + 8);
+  };
+  const pulse = (p, x, y) => {
+    if (p <= 0) return;
+    ctx.save(); ctx.globalAlpha = p; ctx.beginPath(); ctx.arc(x, y, 14 + (1 - p) * 16, 0, Math.PI * 2);
+    ctx.strokeStyle = "#ffcc12"; ctx.lineWidth = 3; ctx.stroke(); ctx.restore();
+  };
+  ctx.save();
+  ctx.globalAlpha = wilds > 0 ? 1 : 0.22;
+  ctx.translate(t.wild.x, t.wild.y); ctx.scale(10 / R, 10 / R);
+  drawChameleon({ id: 0, state: "falling" });
+  ctx.restore();
+  count(wilds, t.wild.x, t.wild.y);
+  pulse(trayPulse.wild, t.wild.x, t.wild.y);
+  ctx.save();
+  if (armed) { ctx.beginPath(); ctx.arc(t.line.x, t.line.y, 15, 0, Math.PI * 2); ctx.fillStyle = "#ffcc12"; ctx.fill(); }
+  ctx.globalAlpha = freeLines > 0 ? 1 : 0.22;
+  ctx.strokeStyle = BRAND.night; ctx.lineWidth = 3; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(t.line.x - 8, t.line.y + 6); ctx.lineTo(t.line.x + 8, t.line.y - 6); ctx.stroke();
+  ctx.restore();
+  count(freeLines, t.line.x, t.line.y);
+  pulse(trayPulse.line, t.line.x, t.line.y);
+}
+
 // The longest chain, drawn as that many linked dots, so the second stat needs no words.
 function drawChainGlyph(cx, cy, n) {
   if (n < 2) return;
@@ -743,12 +833,19 @@ function render() {
   // A line thins as its load rises, so you can see it straining before it snaps.
   for (const w of walls) {
     const strain = Math.min(1, (w.load || 0) / CONFIG.wallLoad);
-    strokePath(w.pts, shade(CONFIG.colours[w.c], 0.8 - 0.2 * strain), CONFIG.lineWidth * (1 - 0.55 * strain), 1);
+    strokePath(w.pts, shade(w.free ? BRAND.night : CONFIG.colours[w.c], 0.8 - 0.2 * strain), CONFIG.lineWidth * (1 - 0.55 * strain), 1);
   }
   if (line) {
     const col = line.ball.c === -1 ? BRAND.night : CONFIG.colours[line.ball.c];
     const pts = line.pts.concat(state === "playing" && line.finger ? [line.finger] : []);
     strokePath(pts, col, CONFIG.lineWidth, 0.8);
+  }
+  if (freeDraw && state === "playing") {
+    // The free line as a rubber band: Night when it can be placed, Earth when it would touch something.
+    const ok = freeClear(freeDraw.a, freeDraw.b);
+    ctx.save(); ctx.setLineDash([9, 6]);
+    strokePath([freeDraw.a, freeDraw.b], ok ? BRAND.night : "#c0512f", CONFIG.lineWidth, ok ? 0.9 : 0.6);
+    ctx.restore();
   }
   for (const b of balls) drawBall(b);
 
@@ -765,7 +862,7 @@ function render() {
       ctx.restore();
       ctx.save();
       ctx.translate(0, k * 60);
-      strokePath(f.pts, shade(CONFIG.colours[f.c], 0.6), CONFIG.lineWidth * 0.5, 1 - k);
+      strokePath(f.pts, shade(f.c === -2 ? BRAND.night : CONFIG.colours[f.c], 0.6), CONFIG.lineWidth * 0.5, 1 - k);
       ctx.restore();
       continue;
     } else if (f.type === "points") {
@@ -791,16 +888,14 @@ function render() {
     ctx.restore();
   }
 
-  // Nudges left, as small marks. Score, as a quiet number.
+  // Nudges left, counting down: filled marks are left, outlines are spent. Score, as a quiet number.
   const sx = shake > 0 ? Math.sin(shake * 60) * 4 : 0;
-  for (let i = 0; i < Math.min(nudges, 12); i++) {
+  for (let i = 0; i < CONFIG.maxNudges; i++) {
     ctx.beginPath(); ctx.arc(18 + i * 13 + sx, 22, 4.5, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(33,33,34,0.5)"; ctx.fill();
+    if (i < nudges) { ctx.fillStyle = "rgba(33,33,34,0.55)"; ctx.fill(); }
+    else { ctx.strokeStyle = "rgba(33,33,34,0.3)"; ctx.lineWidth = 1.5; ctx.stroke(); }
   }
-  if (nudges === 0) {
-    ctx.beginPath(); ctx.arc(18 + sx, 22, 4.5, 0, Math.PI * 2);
-    ctx.strokeStyle = "rgba(33,33,34,0.35)"; ctx.lineWidth = 1.5; ctx.stroke();
-  }
+  drawTray();
   ctx.fillStyle = "rgba(33,33,34,0.5)";
   ctx.font = "700 24px " + BRAND.display;
   ctx.textAlign = "right"; ctx.textBaseline = "middle";
@@ -851,7 +946,7 @@ function render() {
     const speed = fallSpeed();
     const lines = [
       `fps ${fps.toFixed(0)}  t ${t.toFixed(1)}s  speed ${speed.toFixed(1)}`,
-      `balls ${balls.length}  walls ${walls.length}  nudges ${nudges}  clears ${clears}  seed ${SEED}`,
+      `balls ${balls.length}  walls ${walls.length}  nudges ${nudges}  clears ${clears}  wilds ${wilds}  lines ${freeLines}  seed ${SEED}`,
       `state ${state}${line ? "  drawing " + line.pts.length + " pts" : ""}`,
       `dpr ${dpr}  canvas ${canvas.width}x${canvas.height}  screen ${innerWidth}x${innerHeight}`,
       ...Object.entries(CONFIG).map(([k, v]) => `${k}: ${Array.isArray(v) ? v.join(" ") : v}`),
@@ -883,6 +978,7 @@ function frame(now) {
   // Effects keep playing out after the game ends, so a last clear finishes its pop.
   if (fx) { for (const f of fx) f.age += dt; fx = fx.filter(f => f.age < f.life); }
   if (shake > 0) shake = Math.max(0, shake - dt);
+  if (trayPulse) { trayPulse.wild = Math.max(0, trayPulse.wild - dt * 1.2); trayPulse.line = Math.max(0, trayPulse.line - dt * 1.2); }
   render();
   requestAnimationFrame(frame);
 }
